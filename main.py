@@ -12,10 +12,10 @@ dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def start(message: Message):
-    await message.answer("👋 Бот запущен!\n\nПока это тестовая версия.")
+    await message.answer("👋 Бот успешно запущен на Railway!\n\nЭто тестовая версия.")
 
 async def main():
-    print("🚀 Бот запущен на Render")
+    print("🚀 Бот запущен на Railway")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

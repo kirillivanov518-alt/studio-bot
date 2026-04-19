@@ -5,19 +5,13 @@ from aiogram.fsm.context import FSMContext
 
 from keyboards.main_menu import get_main_menu
 from keyboards.booking import get_duration_keyboard
-from states import BookingStates
 from utils.calendar import create_calendar, create_time_keyboard
-from tariffs import calculate_cost, calculate_prepayment
+from states import BookingStates
+from tariffs import calculate_cost, calculate_prepayment, get_duration_text
 
 router = Router()
 
-# Временный отладочный хендлер (можно удалить позже)
-@router.message()
-async def debug_fallback(message: Message):
-    if message.text and "Записаться в студию" in message.text:
-        await start_booking(message, None)  # вызовем основной хендлер
-
-# ====================== Старт ======================
+# ====================== Главное меню ======================
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     await message.answer(
@@ -26,9 +20,8 @@ async def cmd_start(message: Message):
         reply_markup=get_main_menu()
     )
 
-# ====================== Начало брони ======================
-# Запуск бронирования
-@router.message(F.text.contains("Записаться в студию"))
+# ====================== Начало бронирования ======================
+@router.message(F.text == "📅 Записаться в студию")
 async def start_booking(message: Message, state: FSMContext):
     await message.answer(
         text="📆 Выбери дату записи:",
@@ -50,16 +43,16 @@ async def process_date(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BookingStates.waiting_for_time)
     await callback.answer()
 
-# ====================== Выбор времени (с проверкой до 22:00) ======================
+# ====================== Выбор времени + проверка до 22:00 ======================
 @router.callback_query(F.data.startswith("time_"))
 async def process_time(callback: CallbackQuery, state: FSMContext):
     full_dt = callback.data.split("_", 1)[1]
     date_str, time_str = full_dt.split(" ")
     hour = int(time_str.split(":")[0])
 
-    # Проверка: сессия должна заканчиваться до 22:00
-    if hour + 1 > 22:   # грубая проверка, можно улучшить позже
-        await callback.answer("❌ Слишком позднее время. Последнее возможное время — 21:00", show_alert=True)
+    # Проверка: сессия не должна заканчиваться позже 22:00
+    if hour >= 22:
+        await callback.answer("❌ Слишком позднее время. Последнее возможное — 21:00", show_alert=True)
         return
 
     await state.update_data(selected_date=date_str, selected_time=time_str)
@@ -75,7 +68,7 @@ async def process_time(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BookingStates.waiting_for_duration)
     await callback.answer()
 
-# ====================== Длительность ======================
+# ====================== Выбор длительности ======================
 @router.callback_query(F.data.startswith("duration_"))
 async def process_duration(callback: CallbackQuery, state: FSMContext):
     if callback.data == "duration_custom":
@@ -84,16 +77,21 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
         await callback.answer()
         return
 
-    duration = int(callback.data.split("_")[1])
+    duration = float(callback.data.split("_")[1])
     await state.update_data(duration=duration)
 
     data = await state.get_data()
+    full_cost = calculate_cost(duration, False)  # пока без звукорежиссёра
+    prepayment = calculate_prepayment(full_cost)
+
     await callback.message.edit_text(
         text=f"✅ Выбрано:\n"
              f"📅 Дата: <b>{data['selected_date']}</b>\n"
              f"⏰ Время: <b>{data['selected_time']}</b>\n"
-             f"⏱ Длительность: <b>{duration} час{'а' if duration == 1 else 'ов'}</b>\n\n"
-             "🎤 Нужен ли звукорежиссёр? (Да / Нет)",
+             f"⏱ Длительность: <b>{get_duration_text(duration)}</b>\n"
+             f"💰 Стоимость: <b>{full_cost} ₽</b>\n\n"
+             "🎤 Нужен ли звукорежиссёр? (Да / Нет)\n"
+             f"(+400 ₽ за каждый час)",
         parse_mode="HTML"
     )
     await state.set_state(BookingStates.waiting_for_sound_engineer)
@@ -103,25 +101,30 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
 async def process_custom_duration(message: Message, state: FSMContext):
     try:
         duration = float(message.text.replace(",", "."))
-        if duration < 1: duration = 1
+        if duration < 1:
+            duration = 1
     except:
-        await message.answer("Пожалуйста, введи число.")
+        await message.answer("Пожалуйста, введи число (например: 2 или 4.5)")
         return
 
     await state.update_data(duration=duration)
     data = await state.get_data()
+    full_cost = calculate_cost(duration, False)
+    prepayment = calculate_prepayment(full_cost)
 
     await message.answer(
         text=f"✅ Выбрано:\n"
              f"📅 Дата: <b>{data['selected_date']}</b>\n"
              f"⏰ Время: <b>{data['selected_time']}</b>\n"
-             f"⏱ Длительность: <b>{duration} час{'а' if duration == 1 else 'ов'}</b>\n\n"
-             "🎤 Нужен ли звукорежиссёр? (Да / Нет)",
+             f"⏱ Длительность: <b>{get_duration_text(duration)}</b>\n"
+             f"💰 Стоимость: <b>{full_cost} ₽</b>\n\n"
+             "🎤 Нужен ли звукорежиссёр? (Да / Нет)\n"
+             f"(+400 ₽ за каждый час)",
         parse_mode="HTML"
     )
     await state.set_state(BookingStates.waiting_for_sound_engineer)
 
-# ====================== Звукорежиссёр + расчёт стоимости ======================
+# ====================== Звукорежиссёр + итоговая стоимость ======================
 @router.message(BookingStates.waiting_for_sound_engineer)
 async def process_sound_engineer(message: Message, state: FSMContext):
     needs_engineer = message.text.lower() in ["да", "yes", "нужен", "да нужен"]
@@ -135,8 +138,8 @@ async def process_sound_engineer(message: Message, state: FSMContext):
     await state.update_data(full_cost=full_cost, prepayment=prepayment)
 
     await message.answer(
-        text=f"💰 Полная стоимость: <b>{full_cost} ₽</b>\n"
-             f"💸 Предоплата 10%: <b>{prepayment} ₽</b>\n\n"
+        text=f"💰 Итоговая стоимость: <b>{full_cost} ₽</b>\n"
+             f"💸 Предоплата (10%): <b>{prepayment} ₽</b>\n\n"
              "Всё верно? Напиши <b>Да</b> для подтверждения.",
         parse_mode="HTML"
     )
@@ -144,7 +147,7 @@ async def process_sound_engineer(message: Message, state: FSMContext):
 
 # ====================== Подтверждение ======================
 @router.message(BookingStates.waiting_for_payment)
-async def confirm_before_payment(message: Message, state: FSMContext):
+async def confirm_booking(message: Message, state: FSMContext):
     if message.text.lower() not in ["да", "yes", "ок", "подтверждаю"]:
         await message.answer("Напиши <b>Да</b>, если всё правильно.")
         return
@@ -153,9 +156,9 @@ async def confirm_before_payment(message: Message, state: FSMContext):
     await message.answer(
         text=f"✅ Бронирование подтверждено!\n\n"
              f"📅 {data['selected_date']} в {data['selected_time']}\n"
-             f"⏱ {data['duration']} час{'а' if data['duration']==1 else 'ов'}\n"
+             f"⏱ {get_duration_text(data['duration'])}\n"
              f"🎤 Звукорежиссёр: {'Да' if data.get('sound_engineer') else 'Нет'}\n"
-             f"💰 Предоплата: <b>{data['prepayment']} ₽</b>\n\n"
+             f"💰 К оплате (предоплата): <b>{data['prepayment']} ₽</b>\n\n"
              "Оплата через ЮKassa будет добавлена позже.\n"
              "Для отмены используй /cancel",
         parse_mode="HTML"

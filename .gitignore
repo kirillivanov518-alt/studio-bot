@@ -1,0 +1,5 @@
+venv/
+.env
+studio.db
+__pycache__/
+*.pyc

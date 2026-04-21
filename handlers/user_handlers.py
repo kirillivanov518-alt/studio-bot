@@ -2,6 +2,7 @@ from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
+from datetime import datetime, timedelta
 import re
 
 from keyboards.main_menu import get_main_menu
@@ -9,7 +10,8 @@ from keyboards.booking import get_sound_engineer_keyboard, get_confirm_keyboard
 from states import BookingStates
 from utils.calendar import create_calendar, create_time_keyboard, create_duration_keyboard
 from tariffs import calculate_cost, calculate_prepayment, get_duration_text
-from database import save_booking, get_user_bookings
+from database import save_booking, get_user_bookings, get_booking_by_id, cancel_booking, is_slot_taken
+from config import ADMIN_ID
 
 router = Router()
 
@@ -23,13 +25,17 @@ def is_valid_email(email: str) -> bool:
     return bool(re.match(r'^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$', email))
 
 
+def can_refund(booking_date: str, booking_time: str) -> bool:
+    session_dt = datetime.strptime(f"{booking_date} {booking_time}", "%Y-%m-%d %H:%M")
+    return session_dt - datetime.now() > timedelta(hours=24)
+
+
 # ====================== Главное меню ======================
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
-        text="👋 Привет! Добро пожаловать в студию звукозаписи skör!\n\n"
-             "Выбери действие в меню ниже 👇",
+        text="👋 Привет! Добро пожаловать в студию звукозаписи!\n\nВыбери действие в меню ниже 👇",
         reply_markup=get_main_menu()
     )
 
@@ -43,7 +49,7 @@ async def help_handler(message: Message):
     await message.answer(
         text="ℹ️ <b>Как пользоваться ботом:</b>\n\n"
              "📅 <b>Записаться в студию</b> — выбери дату, время и длительность\n"
-             "📋 <b>Мои записи</b> — просмотр твоих броней\n\n"
+             "📋 <b>Мои записи</b> — просмотр и отмена броней\n\n"
              "<b>Тарифы:</b>\n"
              "• 1 час — 1110 ₽\n"
              "• 3 часа — 2990 ₽\n"
@@ -62,21 +68,108 @@ async def help_handler(message: Message):
 @router.message(F.text == "📋 Мои записи")
 async def my_bookings(message: Message):
     bookings = await get_user_bookings(message.from_user.id)
+
     if not bookings:
         await message.answer("У тебя пока нет броней.\n\nНажми 📅 Записаться в студию!", reply_markup=get_main_menu())
         return
 
     text = "📋 <b>Твои записи:</b>\n\n"
+    buttons = []
+
     for b in bookings:
+        status_icon = "✅" if b["status"] == "confirmed" else "❌"
         text += (
-            f"🗓 <b>{b['date']}</b> в <b>{b['time']}</b>\n"
-            f"⏱ {get_duration_text(b['duration'])}\n"
-            f"🎤 Звукорежиссёр: {'Да' if b['sound_engineer'] else 'Нет'}\n"
-            f"💰 Сумма: {b['amount']} ₽ (предоплата: {b['prepayment']} ₽)\n"
-            f"📌 Статус: {b['status']}\n"
+            f"{status_icon} <b>#{b['id']}</b> — {b['date']} в {b['time']}\n"
+            f"⏱ {get_duration_text(b['duration'])} | 🎤 {'Да' if b['sound_engineer'] else 'Нет'}\n"
+            f"💰 {b['amount']} ₽ (пред. {b['prepayment']} ₽)\n"
             f"──────────────\n"
         )
-    await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
+        if b["status"] == "confirmed":
+            buttons.append([InlineKeyboardButton(
+                text=f"❌ Отменить бронь #{b['id']}",
+                callback_data=f"cancel_booking_{b['id']}"
+            )])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    await message.answer(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+# ====================== Отмена брони ======================
+@router.callback_query(F.data.startswith("cancel_booking_"))
+async def ask_cancel_booking(callback: CallbackQuery):
+    booking_id = int(callback.data.replace("cancel_booking_", ""))
+    booking = await get_booking_by_id(booking_id)
+
+    if not booking or booking["status"] != "confirmed":
+        await callback.answer("❌ Бронь не найдена или уже отменена.", show_alert=True)
+        return
+
+    refund = can_refund(booking["date"], booking["time"])
+    refund_text = (
+        "✅ Предоплата будет возвращена (до сессии больше 24 часов)"
+        if refund else
+        "⚠️ Предоплата НЕ возвращается (до сессии меньше 24 часов)"
+    )
+
+    await callback.message.answer(
+        text=f"Ты хочешь отменить бронь <b>#{booking_id}</b>?\n\n"
+             f"📅 {booking['date']} в {booking['time']}\n"
+             f"⏱ {get_duration_text(booking['duration'])}\n\n"
+             f"{refund_text}\n\nПодтвердить отмену?",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Да, отменить", callback_data=f"confirm_cancel_{booking_id}"),
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_bookings")
+            ]
+        ])
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("confirm_cancel_"))
+async def confirm_cancel_booking(callback: CallbackQuery, bot):
+    booking_id = int(callback.data.replace("confirm_cancel_", ""))
+    booking = await get_booking_by_id(booking_id)
+
+    if not booking:
+        await callback.answer("❌ Бронь не найдена.", show_alert=True)
+        return
+
+    await cancel_booking(booking_id)
+    refund = can_refund(booking["date"], booking["time"])
+
+    await callback.message.edit_text(
+        text=f"✅ Бронь <b>#{booking_id}</b> отменена.\n\n"
+             + ("💸 Предоплата будет возвращена в течение 3-5 дней."
+                if refund else
+                "⚠️ Предоплата не возвращается — отмена менее чем за 24 часа."),
+        parse_mode="HTML"
+    )
+
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"❌ <b>Отмена брони #{booking_id}</b>\n\n"
+                 f"👤 {booking['client_name']}\n"
+                 f"📱 {booking['phone']}\n"
+                 f"📅 {booking['date']} в {booking['time']}\n"
+                 f"⏱ {get_duration_text(booking['duration'])}\n\n"
+                 + (f"💸 Нужно вернуть предоплату: {booking['prepayment']} ₽"
+                    if refund else
+                    "💰 Предоплата не возвращается"),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+    await callback.answer()
+
+
+@router.callback_query(F.data == "back_to_bookings")
+async def back_to_bookings(callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.answer()
 
 
 # ====================== Начало бронирования ======================
@@ -123,12 +216,14 @@ async def process_date(callback: CallbackQuery, state: FSMContext):
 async def process_time(callback: CallbackQuery, state: FSMContext):
     full_dt = callback.data[5:]
     date_str, time_str = full_dt.split(" ")
+
+    if await is_slot_taken(date_str, time_str):
+        await callback.answer("❌ Это время уже занято, выбери другое!", show_alert=True)
+        return
+
     await state.update_data(selected_date=date_str, selected_time=time_str)
     await callback.message.edit_text(
-        text=f"✅ Выбрано:\n"
-             f"📅 Дата: <b>{date_str}</b>\n"
-             f"⏰ Время: <b>{time_str}</b>\n\n"
-             "⏱ Выбери длительность сессии:",
+        text=f"✅ Выбрано:\n📅 Дата: <b>{date_str}</b>\n⏰ Время: <b>{time_str}</b>\n\n⏱ Выбери длительность сессии:",
         reply_markup=create_duration_keyboard(date_str, time_str),
         parse_mode="HTML"
     )
@@ -146,8 +241,7 @@ async def process_duration(callback: CallbackQuery, state: FSMContext):
 
     if callback.data == "duration_custom":
         await callback.message.edit_text(
-            f"✏️ Введи количество часов от 1 до {max_dur}:\n"
-            f"(можно дробное, например: 1.5 или 2)"
+            f"✏️ Введи количество часов от 1 до {max_dur}:\n(только целые числа)"
         )
         await state.set_state(BookingStates.waiting_for_custom_duration)
         await callback.answer()
@@ -171,24 +265,19 @@ async def process_custom_duration(message: Message, state: FSMContext):
     max_dur = 22 - hour
 
     try:
-        duration = float(message.text.strip().replace(",", "."))
+        duration = int(message.text.strip())
     except ValueError:
-        await message.answer(f"❌ Введи число (например: 2 или 1.5)\nМаксимум: {max_dur} ч.")
+        await message.answer(f"❌ Введи целое число (например: 2)\nМаксимум: {max_dur} ч.")
         return
 
-    if duration < 1:
-        await message.answer(f"❌ Минимум 1 час. Введи число от 1 до {max_dur}:")
-        return
-
-    if duration > max_dur:
+    if duration < 1 or duration > max_dur:
         await message.answer(
-            f"❌ При старте в {time_str} максимум <b>{max_dur} ч.</b> (студия до 22:00)\n"
-            f"Введи число от 1 до {max_dur}:",
+            f"❌ Введи число от 1 до {max_dur}:",
             parse_mode="HTML"
         )
         return
 
-    await _set_duration(message, state, duration, edit=False)
+    await _set_duration(message, state, float(duration), edit=False)
 
 
 async def _set_duration(msg, state: FSMContext, duration: float, edit: bool):
@@ -222,7 +311,6 @@ async def process_engineer(callback: CallbackQuery, state: FSMContext):
     full_cost = calculate_cost(duration, needs_engineer)
     prepayment = calculate_prepayment(full_cost)
     await state.update_data(sound_engineer=needs_engineer, full_cost=full_cost, prepayment=prepayment)
-
     await callback.message.edit_text(text="👤 Введите ваше имя:")
     await state.set_state(BookingStates.waiting_for_name)
     await callback.answer()
@@ -249,18 +337,12 @@ async def process_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     if not is_valid_phone(phone):
         await message.answer(
-            "❌ Номер не распознан. Попробуй ещё раз.\n\n"
-            "Примеры правильного формата:\n"
-            "<b>+79001234567</b>\n"
-            "<b>89001234567</b>",
+            "❌ Номер не распознан. Попробуй ещё раз.\n\nПримеры:\n<b>+79001234567</b>\n<b>89001234567</b>",
             parse_mode="HTML"
         )
         return
     await state.update_data(phone=phone)
-    await message.answer(
-        "📧 Введите email для чека:\n\nПример: <b>example@mail.ru</b>",
-        parse_mode="HTML"
-    )
+    await message.answer("📧 Введите email для чека:\n\nПример: <b>example@mail.ru</b>", parse_mode="HTML")
     await state.set_state(BookingStates.waiting_for_email)
 
 
@@ -269,11 +351,7 @@ async def process_phone(message: Message, state: FSMContext):
 async def process_email(message: Message, state: FSMContext):
     email = message.text.strip()
     if not is_valid_email(email):
-        await message.answer(
-            "❌ Email не распознан. Попробуй ещё раз.\n\n"
-            "Пример: <b>example@mail.ru</b>",
-            parse_mode="HTML"
-        )
+        await message.answer("❌ Email не распознан.\n\nПример: <b>example@mail.ru</b>", parse_mode="HTML")
         return
     await state.update_data(email=email)
     await message.answer(
@@ -315,7 +393,7 @@ async def process_comment(message: Message, state: FSMContext):
 
 # ====================== Подтверждение ======================
 @router.callback_query(F.data == "confirm_yes", BookingStates.waiting_for_payment)
-async def confirm_booking(callback: CallbackQuery, state: FSMContext):
+async def confirm_booking(callback: CallbackQuery, state: FSMContext, bot):
     data = await state.get_data()
 
     booking_id = await save_booking(
@@ -333,17 +411,36 @@ async def confirm_booking(callback: CallbackQuery, state: FSMContext):
         prepayment=data["prepayment"]
     )
 
+    engineer_text = "Да" if data.get("sound_engineer") else "Нет"
+
     await callback.message.edit_text(
         text=f"✅ <b>Бронирование подтверждено!</b>\n\n"
              f"📅 {data['selected_date']} в {data['selected_time']}\n"
              f"⏱ {get_duration_text(data['duration'])}\n"
-             f"🎤 Звукорежиссёр: {'Да' if data.get('sound_engineer') else 'Нет'}\n"
+             f"🎤 Звукорежиссёр: {engineer_text}\n"
              f"💸 Предоплата: <b>{data['prepayment']} ₽</b>\n\n"
              f"🔖 Номер брони: <b>#{booking_id}</b>\n\n"
-             "Оплата через ЮKassa будет добавлена в ближайшее время.\n"
-             "Для отмены брони используй /cancel",
+             "Посмотреть и отменить бронь — кнопка 📋 Мои записи",
         parse_mode="HTML"
     )
+
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"🔔 <b>Новая бронь #{booking_id}!</b>\n\n"
+                 f"👤 {data['client_name']}\n"
+                 f"📱 {data['phone']}\n"
+                 f"📧 {data['email']}\n"
+                 f"📅 {data['selected_date']} в {data['selected_time']}\n"
+                 f"⏱ {get_duration_text(data['duration'])}\n"
+                 f"🎤 Звукарь: {engineer_text}\n"
+                 f"💬 {data.get('comment') or 'нет'}\n\n"
+                 f"💰 {data['full_cost']} ₽ | Предоплата: {data['prepayment']} ₽",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
     await state.clear()
     await callback.answer()
 
@@ -383,10 +480,7 @@ async def back_to_duration(callback: CallbackQuery, state: FSMContext):
     date_str = data.get("selected_date", "")
     time_str = data.get("selected_time", "")
     await callback.message.edit_text(
-        text=f"✅ Выбрано:\n"
-             f"📅 Дата: <b>{date_str}</b>\n"
-             f"⏰ Время: <b>{time_str}</b>\n\n"
-             "⏱ Выбери длительность сессии:",
+        text=f"✅ Выбрано:\n📅 Дата: <b>{date_str}</b>\n⏰ Время: <b>{time_str}</b>\n\n⏱ Выбери длительность:",
         reply_markup=create_duration_keyboard(date_str, time_str),
         parse_mode="HTML"
     )
@@ -410,13 +504,11 @@ async def back_to_engineer(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ====================== Игнор пустых кнопок ======================
 @router.callback_query(F.data == "ignore")
 async def ignore_callback(callback: CallbackQuery):
     await callback.answer()
 
 
-# ====================== Отмена ======================
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
     await state.clear()
